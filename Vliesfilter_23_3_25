@@ -1,0 +1,533 @@
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <Update.h>
+#include <Preferences.h>
+#include <ArduinoJson.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+
+// WiFi-instellingen
+const char* ssid = "The Incredibles";  // Vul hier jouw WiFi-SSID in
+const char* password = "@Anjer 35";    // Vul hier jouw WiFi-wachtwoord in
+
+// API instellingen
+const char* host = "esp32";
+WebServer server(80);
+
+// NTP Client
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 3600, 60000); // NTP server, UTC offset (1 hour), update interval (60 seconds)
+
+// Pin-definities (gebruik GPIO-nummers)
+#define FLOAT_SWITCH_PIN 27  // GPIO27 voor de vlotterschakelaar Groen
+#define CW_BUTTON_PIN 32     // GPIO32 voor CW-knop Blauw
+#define CCW_BUTTON_PIN 33    // GPIO33 voor CCW-knop Groen
+#define CW_MOTOR_PIN 25      // GPIO25 voor CW-motor Oranje
+#define CCW_MOTOR_PIN 26     // GPIO26 voor CCW-motor Geel
+
+#define LOG_SIZE 5  // Store last 5 rotations
+unsigned long rotationLog[LOG_SIZE] = { 0, 0, 0, 0, 0 };
+static unsigned long lastRotationTime = 0;
+
+Preferences preferences;  // NVS opslag (ESP32 opslag)
+
+// Motor en timing instellingen
+unsigned long MotorrunTime = 75;
+unsigned long MotorrunCorr = 3;
+unsigned long RotatieCount = 1;
+const unsigned long MinimumDelay = 3600;
+const unsigned long MaximumDelay = 259200;
+
+unsigned long Starttime = 0;
+unsigned long Current_time = 0;
+unsigned long MotorRunStart = 0;
+unsigned long LastRun = 0;
+unsigned long PreviousRun = 0;
+bool motorRunning = false;
+bool manualControl = false;
+
+unsigned long floatSwitchHighStart = 1;        // Track when float switch goes high
+const unsigned long floatSwitchDelay = 30000;  // 30 seconds delay before activating
+
+// Opslaan van status naar NVS-geheugen
+void saveState() {
+  preferences.putULong("start_time", Starttime);
+  preferences.putULong("prev_run", PreviousRun);
+  preferences.putBool("motor_run", motorRunning);
+  preferences.putUInt("rotation", RotatieCount);
+
+  // Save last 5 rotation timestamps
+  for (int i = 0; i < LOG_SIZE; i++) {
+    preferences.putULong(("log_" + String(i)).c_str(), rotationLog[i]);
+  }
+}
+
+// Laden van opgeslagen status
+void loadState() {
+  Starttime = preferences.getULong("start_time", 0);
+  PreviousRun = preferences.getULong("prev_run", 0);
+  motorRunning = preferences.getBool("motor_run", false);
+  RotatieCount = preferences.getUInt("rotation", 1);
+
+  // Load last 5 rotation timestamps
+  for (int i = 0; i < LOG_SIZE; i++) {
+    rotationLog[i] = preferences.getULong(("log_" + String(i)).c_str(), 0);
+  }
+
+  // Ensure PreviousRun is valid
+  if (PreviousRun == 0 || PreviousRun > timeClient.getEpochTime()) {
+    Serial.println("Invalid PreviousRun detected, resetting...");
+    PreviousRun = Starttime;  // Avoid large gaps due to uninitialized data
+    saveState();
+  }
+}
+
+void logRotationTime(unsigned long timestamp) {
+  // Shift all logs to make room for the new entry
+  for (int i = LOG_SIZE - 1; i > 0; i--) {
+    rotationLog[i] = rotationLog[i - 1];
+  }
+  rotationLog[0] = timestamp;  // Store new rotation at index 0
+  saveState();                 // Save new log to memory
+}
+
+String formatTime(unsigned long sec) {
+  unsigned long days = sec / 86400;
+  unsigned long hours = (sec % 86400) / 3600;
+  unsigned long minutes = (sec % 3600) / 60;
+  unsigned long seconds = sec % 60;
+
+  return String(days) + "d " + String(hours) + "h " + String(minutes) + "m " + String(seconds) + "s";
+}
+
+// Motor aansturen
+void startMotorCW() {
+  digitalWrite(CW_MOTOR_PIN, HIGH);
+  digitalWrite(CCW_MOTOR_PIN, LOW);
+  Serial.println("Motor draait CW");
+}
+
+void startMotorCCW() {
+  digitalWrite(CW_MOTOR_PIN, LOW);
+  digitalWrite(CCW_MOTOR_PIN, HIGH);
+  Serial.println("Motor draait CCW");
+}
+
+void stopMotor() {
+  digitalWrite(CW_MOTOR_PIN, LOW);
+  digitalWrite(CCW_MOTOR_PIN, LOW);
+  Serial.println("Motor gestopt");
+}
+
+// Debounce functie voor knoppen
+bool debounceButton(int pin) {
+  static unsigned long lastPressTime = 0;
+  const unsigned long debounceDelay = 50;
+  bool buttonState = !digitalRead(pin);
+
+  if (buttonState) {
+    if (millis() - lastPressTime > debounceDelay) {
+      lastPressTime = millis();
+      return true;
+    }
+  }
+  return false;
+}
+
+void handleDataAPI() {
+  String response = R"rawliteral(
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>ESP32 Vliesfilter Status</title>
+        <style>
+            body { font-family: Arial, sans-serif; background-color: #f4f4f4; text-align: center; margin: 20px; padding: 20px; }
+            .container { max-width: 600px; margin: auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0px 0px 10px rgba(0, 0, 0, 0.1); }
+            h2, h3 { color: #333; }
+            .status { font-size: 18px; font-weight: bold; padding: 10px; border-radius: 5px; display: inline-block; }
+            .status.on { background-color: #4CAF50; color: white; }
+            .status.off { background-color: #FF5733; color: white; }
+            .data-box { text-align: left; padding: 10px; border-bottom: 1px solid #ddd; }
+            .data-box:last-child { border-bottom: none; }
+            .button { background-color: #007BFF; color: white; border: none; padding: 10px 20px; font-size: 16px; cursor: pointer; margin-top: 10px; border-radius: 5px; }
+            .button:hover { background-color: #0056b3; }
+            ul { padding: 0; list-style-type: none; }
+            li { padding: 8px; border-bottom: 1px solid #ddd; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h2>ESP32 Vliesfilter Status</h2>
+            <div class="data-box"><strong>Motor Running:</strong> )rawliteral";
+
+  response += "<span class='status " + String(motorRunning ? "on" : "off") + "'>" + String(motorRunning ? "YES" : "NO") + "</span></div>";
+
+  response += "<div class='data-box'><strong>Rotations:</strong> " + String(RotatieCount) + "</div>";
+  response += "<div class='data-box'><strong>Memory Usage:</strong> " + getMemoryUsage() + "</div>";
+
+  response += "<div class='data-box'><strong>Float Switch State:</strong> ";
+  response += "<span class='status " + String(digitalRead(FLOAT_SWITCH_PIN) == HIGH ? "on" : "off") + "'>";
+  response += String(digitalRead(FLOAT_SWITCH_PIN) == HIGH ? "HIGH" : "LOW") + "</span></div>";
+
+  // Huidige tijd toevoegen
+  response += "<div class='data-box'><strong>Current Time:</strong> ";
+  response += timeClient.getFormattedTime() + "</div>";
+
+  response += R"rawliteral(
+            <h3>Last Rotation</h3>
+            <div class="data-box"><strong>Time Since Last Rotation:</strong> )rawliteral"
+              + formatTime(Current_time - Starttime) + R"rawliteral(</div>
+
+            <h3>Last 5 Rotations</h3>
+            <ul>)rawliteral";
+
+  for (int i = 0; i < LOG_SIZE; i++) {
+    if (rotationLog[i] > 0) {
+      String formattedTime = formatTime(rotationLog[i]);
+      Serial.println("Formatted time for rotation: " + formattedTime);  // Debugging
+      response += "<li><strong>Rotation " + String(i + 1) + ":</strong> " + formattedTime + "</li>";
+    }
+  }
+
+  response += R"rawliteral(</ul>
+            <button class="button" onclick="startRotation()">Start Rotation</button>
+            <button class="button" onclick="location.reload()">Refresh</button>
+        </div>
+        <script>
+            function startRotation() {
+                fetch('/start_rotation').then(response => {
+                    if (response.ok) {
+                        alert('Rotation started!');
+                        location.reload();
+                    } else {
+                        alert('Failed to start rotation.');
+                    }
+                });
+            }
+        </script>
+    </body>
+    </html>)rawliteral";
+
+  server.send(200, "text/html", response);
+}
+void handleStartRotation() {
+  if (!motorRunning) {
+    Serial.println("✅ Manual rotation started...");
+
+    motorRunning = true;
+    LastRun = Current_time - PreviousRun;
+    PreviousRun = Current_time;
+    MotorRunStart = Current_time;
+    startMotorCW();
+
+    // Log rotation before updating start time
+    logRotationTime(LastRun);
+
+    Starttime = Current_time;
+    saveState();
+    RotatieCount++;
+    saveState();
+
+    server.send(200, "text/plain", "Rotation started");
+  } else {
+    server.send(400, "text/plain", "Motor is already running");
+  }
+}
+
+void handleReset() {
+  String html = "<html><head><title>ESP Reset</title></head><body>";
+  html += "<h2>ESP Control Panel</h2>";
+  html += "<p>Klik op de knop om de ESP te resetten.</p>";
+  html += "<button onclick=\"resetESP()\" style=\"font-size:20px;padding:10px;\">Reset ESP</button>";
+  html += "<script>";
+  html += "function resetESP() {";
+  html += " fetch('/do_reset').then(response => {";
+  html += " alert('ESP is aan het herstarten...');";
+  html += " setTimeout(() => { location.reload(); }, 2000);";
+  html += " });";
+  html += "}";
+  html += "</script>";
+  html += "</body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+void handleDoReset() {
+  Serial.println("Resetten van instellingen...");
+
+  RotatieCount = 0;
+  lastRotationTime = 0;  // Zorg ervoor dat lastRotationTime gereset blijft.
+
+  // Reset het log volledig
+  for (int i = 0; i < LOG_SIZE; i++) {
+    rotationLog[i] = 0;  // Stel elk log-item in op 0
+  }
+
+  saveState();  // Opslaan in NVS (non-volatile storage)
+
+  server.send(200, "text/plain", "ESP herstart...");
+
+  delay(1000);
+  ESP.restart();
+}
+
+// OTA pagina
+const char* serverIndex = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ESP32 OTA Update</title>
+</head>
+<body>
+  <h2>ESP32 OTA Update</h2>
+  <form method='POST' action='#' enctype='multipart/form-data' id='upload_form'>
+    <input type='file' name='update'>
+    <input type='submit' value='Update'>
+  </form>
+  <div id='prg'>progress: 0%</div>
+  <script>
+    document.querySelector('form').onsubmit = function(e) {
+      e.preventDefault();
+      var data = new FormData(document.querySelector('form'));
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', '/update', true);
+      xhr.upload.onprogress = function(evt) {
+        if (evt.lengthComputable) {
+          document.getElementById('prg').innerText = 'progress: ' + Math.round(evt.loaded / evt.total * 100) + '%';
+        }
+      };
+      xhr.send(data);
+    };
+  </script>
+</body>
+</html>
+)rawliteral";
+
+void checkWiFiConnection() {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("⚠️ WiFi verbinding verloren! Opnieuw verbinden...");
+        WiFi.disconnect();
+        WiFi.reconnect();
+        delay(5000);
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println("✅ WiFi opnieuw verbonden!");
+        } else {
+            Serial.println("❌ WiFi herstel mislukt!");
+        }
+    }
+}
+
+void checkMemory() {
+    if (ESP.getFreeHeap() < 20000) {  // Minder dan 20kB RAM → herstart
+        Serial.println("⚠️ RAM bijna op! Herstart...");
+        saveState();  // 📌 Opslaan vóór herstart
+        delay(500);   // Even wachten om te zorgen dat NVS wordt weggeschreve
+      
+        ESP.restart();
+    }
+}
+
+String getMemoryUsage() {
+    return "Vrij RAM: " + String(ESP.getFreeHeap()) + " bytes";}
+
+// Setup functie
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("ESP32 Start!");
+
+  WiFi.begin(ssid, password);
+  Serial.println("Verbinding met WiFi...");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Verbonden! IP: " + WiFi.localIP().toString());
+
+  // Start NTP client
+  timeClient.begin();
+  timeClient.update();
+
+  if (!MDNS.begin("vliesfilter")) {
+    Serial.println("FOUT: mDNS setup mislukt!");
+  } else {
+    Serial.println("mDNS responder gestart als vliesfilter.local");
+    MDNS.addService("http", "tcp", 80);
+  }
+
+  // **Register Web Endpoints**
+  server.on("/", HTTP_GET, handleDataAPI);
+  server.on("/reset", HTTP_GET, handleReset);
+  server.on("/do_reset", HTTP_GET, handleDoReset);
+  server.on("/start_rotation", HTTP_GET, handleStartRotation);  // Nieuwe endpoint voor handmatige rotatie
+  server.on("/upload", HTTP_GET, []() {
+    server.send(200, "text/html", serverIndex);
+  });
+  server.on(
+    "/update", HTTP_POST, []() {
+      server.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
+    },
+    []() {
+      HTTPUpload& upload = server.upload();
+      if (upload.status == UPLOAD_FILE_START) {
+        Update.begin(UPDATE_SIZE_UNKNOWN);
+      } else if (upload.status == UPLOAD_FILE_WRITE) {
+        Update.write(upload.buf, upload.currentSize);
+      } else if (upload.status == UPLOAD_FILE_END) {
+        if (Update.end(true)) {
+          saveState();
+          delay(500);
+          ESP.restart();
+        }
+      }
+    });
+
+
+  server.begin();
+  Serial.println("Server gestart!");
+
+  preferences.begin("MotorControl", false);
+
+  // **Pin Configuration**
+  pinMode(FLOAT_SWITCH_PIN, INPUT_PULLUP);
+  pinMode(CW_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(CCW_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(CW_MOTOR_PIN, OUTPUT);
+  pinMode(CCW_MOTOR_PIN, OUTPUT);
+  digitalWrite(CW_MOTOR_PIN, LOW);
+  digitalWrite(CCW_MOTOR_PIN, LOW);
+
+  loadState();  // Load saved data
+
+ if (MotorrunTime < 20) {
+    MotorrunTime = 20;
+    Serial.println("MotorrunTime is te laag, ingesteld op 20 seconden.");
+  }
+
+  // **Ensure Starttime is valid**
+  if (Starttime == 0 || Starttime > timeClient.getEpochTime()) {
+    Serial.println("Starttime is invalid, setting new Starttime.");
+    Starttime = timeClient.getEpochTime();
+    saveState();
+  }
+
+  // **Ensure PreviousRun isn't ahead of Starttime**
+  if (PreviousRun > Starttime) {
+    Serial.println("PreviousRun was ahead of Starttime, correcting...");
+    PreviousRun = Starttime;
+    saveState();
+  }
+
+  Serial.print("Loaded Starttime: ");
+  Serial.println(Starttime);
+  Serial.print("Loaded PreviousRun: ");
+  Serial.println(PreviousRun);
+}
+
+// Loop functie
+void loop() {
+  server.handleClient();  // Behandel HTTP-verzoeken
+  checkWiFiConnection();  // Controleer en herstel WiFi-verbinding
+  checkMemory();          // Controleer geheugengebruik
+  timeClient.update();    // Update NTP-tijd
+  Current_time = timeClient.getEpochTime();  // Gebruik NTP-tijd voor timing
+   if (MotorrunTime < 20) {
+    MotorrunTime = 20;
+    Serial.println("MotorrunTime is te laag, ingesteld op 20 seconden.");
+  }
+
+  // Controleer of MotorrunTime minimaal 20 seconden is
+  if (MotorrunTime < 20) {
+    MotorrunTime = 20;
+    Serial.println("MotorrunTime is te laag, ingesteld op 20 seconden.");
+  }
+
+  // Lees schakelaar en knoppen
+  bool floatSwitchState = digitalRead(FLOAT_SWITCH_PIN);
+  bool cwButtonState = debounceButton(CW_BUTTON_PIN);
+  bool ccwButtonState = debounceButton(CCW_BUTTON_PIN);
+
+  // Track wanneer de float switch LOW wordt
+  if (floatSwitchState == LOW) {
+    if (floatSwitchHighStart == 1) {
+      floatSwitchHighStart = Current_time;
+      Serial.println("Float switch went LOW. Started timing...");
+    }
+  } else {
+    if (floatSwitchHighStart != 1) {
+      Serial.println("Float switch returned to HIGH. Resetting timer.");
+    }
+    floatSwitchHighStart = 1;
+  }
+
+  // Automatisch starten van de motor als aan voorwaarden is voldaan
+  if (!manualControl && floatSwitchHighStart != 1 && (Current_time - floatSwitchHighStart >= floatSwitchDelay) && (Current_time - Starttime >= MinimumDelay)) {
+    Serial.println("✅ Motor conditions met, starting CW motor...");
+
+    motorRunning = true;
+    LastRun = Current_time - PreviousRun;
+    PreviousRun = Current_time;
+    MotorRunStart = Current_time;
+    startMotorCW();
+
+    // Log de rotatie voordat de starttijd wordt bijgewerkt
+    logRotationTime(LastRun);
+
+    Starttime = Current_time;
+    saveState();
+    RotatieCount++;
+    saveState();
+  }
+
+  // Start motor automatisch na 3 dagen (MaximumDelay)
+  if (!manualControl && !motorRunning && (PreviousRun > 0) && (Current_time - PreviousRun >= MaximumDelay)) {
+    Serial.println("3-day interval reached. Running CW motor...");
+
+    // Bewaar de tijd sinds de laatste rotatie
+    LastRun = Current_time - PreviousRun;
+
+    // Log de rotatie voordat de vorige run wordt bijgewerkt
+    logRotationTime(Current_time);
+
+    PreviousRun = Current_time;
+    Starttime = Current_time;
+
+    motorRunning = true;
+    MotorRunStart = Current_time;
+    startMotorCW();
+    saveState();
+
+    RotatieCount++;
+    saveState();
+  }
+
+  // Stop de motor na de ingestelde tijd (MotorrunTime)
+  if (motorRunning && (Current_time - MotorRunStart >= MotorrunTime)) {
+    Serial.println("Motor run complete. Stopping CW motor...");
+    stopMotor();
+    motorRunning = false;
+    manualControl = false;  // Zorg ervoor dat handmatige bediening wordt gereset
+    saveState();
+  }
+
+  // Handmatige bediening via knoppen
+  if (cwButtonState) {
+    Serial.println("Manual CW button pressed!");
+    startMotorCW();
+    manualControl = true;
+  } else if (ccwButtonState) {
+    Serial.println("Manual CCW button pressed!");
+    startMotorCCW();
+    manualControl = true;
+  } else if (manualControl) {
+    Serial.println("Stopping motor after manual control.");
+    stopMotor();
+    manualControl = false;
+  }
+
+  delay(1000);  // Wacht 1 seconde voordat de loop opnieuw begint
+}
